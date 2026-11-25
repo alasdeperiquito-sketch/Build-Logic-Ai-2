@@ -130,24 +130,28 @@ MAPA_7BITS = {
 }
 
 
-def texto_a_7bits(texto: str) -> list[str]:
-    # Normaliza caracteres raros (como ñ o ¿/¡ si no están) y convierte carácter a carácter
+def texto_a_8bits(texto: str) -> list[str]:
     reemplazos = {"ñ": "n", "Ñ": "N", "¿": "?", "¡": "!"}
     salida = []
     for ch in texto:
         ch_limpio = reemplazos.get(ch, ch)
-        codigo = MAPA_7BITS.get(ch_limpio)
-        if codigo is None and ch_limpio.lower() in MAPA_7BITS:
-            codigo = MAPA_7BITS[ch_limpio.lower()]
-        if codigo is None:
-            codigo = "0000000"
-        salida.append(codigo)
+        codigo_7 = MAPA_7BITS.get(ch_limpio)
+        if codigo_7 is None and ch_limpio.lower() in MAPA_7BITS:
+            codigo_7 = MAPA_7BITS[ch_limpio.lower()]
+        if codigo_7 is None:
+            codigo_7 = "0000000"
+        salida.append(codigo_7 + "0")
     return salida
+
+
+def construir_cola(texto: str) -> list[str]:
+    return ["00000001"] + texto_a_8bits(texto)
 
 
 estado = {
     "respuesta": "Hola",
-    "bits": texto_a_7bits("Hola"),
+    "cola": construir_cola("Hola"),
+    "cursor": 0,
 }
 
 HTML_CHAT = """
@@ -157,7 +161,7 @@ HTML_CHAT = """
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Chat IA - Build Logic</title>
   <style>
-    body { font-family: sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; background: #111; color: #eee; }
+    body { font-family: sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px; background: #111; color: #eee; }
     input, button { width: 100%; padding: 12px; margin-top: 10px; font-size: 16px; border-radius: 8px; border: none; }
     input { background: #222; color: #fff; }
     button { background: #2563eb; color: white; font-weight: bold; cursor: pointer; }
@@ -173,7 +177,9 @@ HTML_CHAT = """
   <div class="box">
     <strong>Última respuesta:</strong>
     <p>{{ respuesta }}</p>
-    <strong>7 bits:</strong>
+    <strong>Progreso cola:</strong>
+    <p>{{ cursor }} / {{ total }}</p>
+    <strong>8 bits:</strong>
     <p>{{ bits }}</p>
   </div>
 </body>
@@ -186,7 +192,9 @@ def web_chat():
     return render_template_string(
         HTML_CHAT,
         respuesta=estado["respuesta"],
-        bits=" ".join(estado["bits"]),
+        cursor=estado["cursor"],
+        total=len(estado["cola"]),
+        bits=" ".join(estado["cola"]),
     )
 
 
@@ -203,27 +211,33 @@ def preguntar_desde_web():
                     messages=[
                         {
                             "role": "system",
-                            "content": "Responde en espanol, maximo 80 caracteres, sin emojis raros ni tildes complejas.",
+                            "content": "Responde en espanol, maximo 60 caracteres, sin emojis raros ni tildes complejas.",
                         },
                         {"role": "user", "content": mensaje},
                     ],
-                    max_tokens=60,
+                    max_tokens=50,
                 )
                 texto = chat.choices[0].message.content.strip()
             except Exception as e:
-                texto = f"Error: {str(e)[:60]}"
+                texto = f"Error: {str(e)[:50]}"
         estado["respuesta"] = texto
-        estado["bits"] = texto_a_7bits(texto)
+        estado["cola"] = construir_cola(texto)
+        estado["cursor"] = 0
     return render_template_string(
         HTML_CHAT,
         respuesta=estado["respuesta"],
-        bits=" ".join(estado["bits"]),
+        cursor=estado["cursor"],
+        total=len(estado["cola"]),
+        bits=" ".join(estado["cola"]),
     )
 
 
 @app.route("/ia", methods=["GET"])
 def leer_en_roblox():
-    return jsonify({
-        "value": estado["respuesta"],
-        "bits": estado["bits"],
-    })
+    idx = estado["cursor"]
+    cola = estado["cola"]
+    if idx < len(cola):
+        codigo = cola[idx]
+        estado["cursor"] = idx + 1
+        return jsonify({"value": codigo})
+    return jsonify({"value": "00000000"})
