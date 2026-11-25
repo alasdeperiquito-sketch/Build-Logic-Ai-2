@@ -5,10 +5,150 @@ from groq import Groq
 app = Flask(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Escribe aquí el ID exacto de un modelo activo en tu cuenta de Groq
-MODELO_GROQ = "openai/gpt-oss-20b"
+# Pon aquí el ID exacto de tu modelo activo de Groq
+MODELO_GROQ = os.environ.get("openai/gpt-oss-20b", "")
 
-estado = {"respuesta": "Esperando pregunta..."}
+MAPA_7BITS = {
+    " ": "0000000",
+    "a": "0000001",
+    "b": "0000010",
+    "c": "0000011",
+    "d": "0000100",
+    "e": "0000101",
+    "f": "0000110",
+    "g": "0000111",
+    "h": "0001000",
+    "i": "0001001",
+    "j": "0001010",
+    "k": "0001011",
+    "l": "0001100",
+    "m": "0001101",
+    "n": "0001110",
+    "o": "0001111",
+    "p": "0010000",
+    "q": "0010001",
+    "r": "0010010",
+    "s": "0010011",
+    "t": "0010100",
+    "u": "0010101",
+    "v": "0010110",
+    "w": "0010111",
+    "x": "0011000",
+    "y": "0011001",
+    "z": "0011010",
+    "1": "0011011",
+    "2": "0011100",
+    "3": "0011101",
+    "4": "0011110",
+    "5": "0011111",
+    "6": "0100000",
+    "7": "0100001",
+    "8": "0100010",
+    "9": "0100011",
+    "0": "0100100",
+    "-": "0100101",
+    "=": "0100110",
+    ".": "0100111",
+    ",": "0101000",
+    ";": "0101001",
+    "/": "0101010",
+    "à": "0101011",
+    "â": "0101100",
+    "ç": "0101101",
+    "è": "0101110",
+    "é": "0101111",
+    "ê": "0110000",
+    "î": "0110001",
+    "ï": "0110010",
+    "û": "0110011",
+    "|": "0110100",
+    '"': "0110111",
+    "🟧": "0111000",
+    "🟨": "0111001",
+    "🟩": "0111010",
+    "🟦": "0111011",
+    "🟪": "0111100",
+    "⬜": "0111101",
+    "▶": "0111110",
+    "A": "1000001",
+    "B": "1000010",
+    "C": "1000011",
+    "D": "1000100",
+    "E": "1000101",
+    "F": "1000110",
+    "G": "1000111",
+    "H": "1001000",
+    "I": "1001001",
+    "J": "1001010",
+    "K": "1001011",
+    "L": "1001100",
+    "M": "1001101",
+    "N": "1001110",
+    "O": "1001111",
+    "P": "1010000",
+    "Q": "1010001",
+    "R": "1010010",
+    "S": "1010011",
+    "T": "1010100",
+    "U": "1010101",
+    "V": "1010110",
+    "W": "1010111",
+    "X": "1011000",
+    "Y": "1011001",
+    "Z": "1011010",
+    "!": "1011011",
+    "@": "1011100",
+    "#": "1011101",
+    "$": "1011110",
+    "%": "1011111",
+    "?": "1100000",
+    "&": "1100001",
+    "*": "1100010",
+    "(": "1100011",
+    ")": "1100100",
+    "_": "1100101",
+    "+": "1100110",
+    "'": "1101000",
+    ":": "1101001",
+    "~": "1101010",
+    "À": "1101011",
+    "Â": "1101100",
+    "Ç": "1101101",
+    "È": "1101110",
+    "É": "1101111",
+    "Ê": "1110000",
+    "Ì": "1110001",
+    "Ï": "1110010",
+    "Û": "1110011",
+    "¦": "1110100",
+    "^": "1110111",
+    "█": "1111010",
+    "➡": "1111011",
+    "⬅": "1111100",
+    "⬆": "1111101",
+    "⬇": "1111110",
+}
+
+
+def texto_a_7bits(texto: str) -> list[str]:
+    # Normaliza caracteres raros (como ñ o ¿/¡ si no están) y convierte carácter a carácter
+    reemplazos = {"ñ": "n", "Ñ": "N", "¿": "?", "¡": "!"}
+    salida = []
+    for ch in texto:
+        ch_limpio = reemplazos.get(ch, ch)
+        codigo = MAPA_7BITS.get(ch_limpio)
+        if codigo is None and ch_limpio.lower() in MAPA_7BITS:
+            codigo = MAPA_7BITS[ch_limpio.lower()]
+        if codigo is None:
+            codigo = "0000000"
+        salida.append(codigo)
+    return salida
+
+
+estado = {
+    "respuesta": "Hola",
+    "bits": texto_a_7bits("Hola"),
+}
 
 HTML_CHAT = """
 <!doctype html>
@@ -21,7 +161,7 @@ HTML_CHAT = """
     input, button { width: 100%; padding: 12px; margin-top: 10px; font-size: 16px; border-radius: 8px; border: none; }
     input { background: #222; color: #fff; }
     button { background: #2563eb; color: white; font-weight: bold; cursor: pointer; }
-    .box { margin-top: 20px; padding: 14px; background: #1e1e1e; border-radius: 8px; }
+    .box { margin-top: 20px; padding: 14px; background: #1e1e1e; border-radius: 8px; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -31,8 +171,10 @@ HTML_CHAT = """
     <button type="submit">Enviar a Roblox</button>
   </form>
   <div class="box">
-    <strong>Última respuesta en pantalla:</strong>
+    <strong>Última respuesta:</strong>
     <p>{{ respuesta }}</p>
+    <strong>7 bits:</strong>
+    <p>{{ bits }}</p>
   </div>
 </body>
 </html>
@@ -41,7 +183,11 @@ HTML_CHAT = """
 
 @app.route("/", methods=["GET"])
 def web_chat():
-    return render_template_string(HTML_CHAT, respuesta=estado["respuesta"])
+    return render_template_string(
+        HTML_CHAT,
+        respuesta=estado["respuesta"],
+        bits=" ".join(estado["bits"]),
+    )
 
 
 @app.route("/preguntar", methods=["POST"])
@@ -49,7 +195,7 @@ def preguntar_desde_web():
     mensaje = request.form.get("mensaje", "").strip()
     if mensaje:
         if not MODELO_GROQ.strip():
-            estado["respuesta"] = "Configura MODELO_GROQ en main.py"
+            texto = "Configura MODELO_GROQ"
         else:
             try:
                 chat = client.chat.completions.create(
@@ -57,18 +203,27 @@ def preguntar_desde_web():
                     messages=[
                         {
                             "role": "system",
-                            "content": "Responde en español, máximo 150 caracteres y sin emojis.",
+                            "content": "Responde en espanol, maximo 80 caracteres, sin emojis raros ni tildes complejas.",
                         },
                         {"role": "user", "content": mensaje},
                     ],
-                    max_tokens=80,
+                    max_tokens=60,
                 )
-                estado["respuesta"] = chat.choices[0].message.content.strip()
+                texto = chat.choices[0].message.content.strip()
             except Exception as e:
-                estado["respuesta"] = f"Error Groq: {str(e)[:120]}"
-    return render_template_string(HTML_CHAT, respuesta=estado["respuesta"])
+                texto = f"Error: {str(e)[:60]}"
+        estado["respuesta"] = texto
+        estado["bits"] = texto_a_7bits(texto)
+    return render_template_string(
+        HTML_CHAT,
+        respuesta=estado["respuesta"],
+        bits=" ".join(estado["bits"]),
+    )
 
 
 @app.route("/ia", methods=["GET"])
 def leer_en_roblox():
-    return jsonify({"value": estado["respuesta"]})
+    return jsonify({
+        "value": estado["respuesta"],
+        "bits": estado["bits"],
+    })
