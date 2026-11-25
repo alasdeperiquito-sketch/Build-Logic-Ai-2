@@ -5,6 +5,9 @@ from groq import Groq
 app = Flask(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
+# Escribe aquí el ID exacto de un modelo activo en tu cuenta de Groq
+MODELO_GROQ = "openai/gpt-oss-20b"
+
 estado = {"respuesta": "Esperando pregunta..."}
 
 HTML_CHAT = """
@@ -45,21 +48,24 @@ def web_chat():
 def preguntar_desde_web():
     mensaje = request.form.get("mensaje", "").strip()
     if mensaje:
-        try:
-            chat = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Responde en español, máximo 150 caracteres y sin emojis.",
-                    },
-                    {"role": "user", "content": mensaje},
-                ],
-                max_tokens=80,
-            )
-            estado["respuesta"] = chat.choices[0].message.content.strip()
-        except Exception as e:
-            estado["respuesta"] = f"Error Groq: {str(e)[:120]}"
+        if not MODELO_GROQ.strip():
+            estado["respuesta"] = "Configura MODELO_GROQ en main.py"
+        else:
+            try:
+                chat = client.chat.completions.create(
+                    model=MODELO_GROQ.strip(),
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Responde en español, máximo 150 caracteres y sin emojis.",
+                        },
+                        {"role": "user", "content": mensaje},
+                    ],
+                    max_tokens=80,
+                )
+                estado["respuesta"] = chat.choices[0].message.content.strip()
+            except Exception as e:
+                estado["respuesta"] = f"Error Groq: {str(e)[:120]}"
     return render_template_string(HTML_CHAT, respuesta=estado["respuesta"])
 
 
