@@ -47,7 +47,7 @@ def preguntar_desde_web():
     if mensaje:
         try:
             chat = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="llama-3.3-70b-versatile",
                 messages=[
                     {
                         "role": "system",
@@ -58,8 +58,8 @@ def preguntar_desde_web():
                 max_tokens=80,
             )
             estado["respuesta"] = chat.choices[0].message.content.strip()
-        except Exception:
-            estado["respuesta"] = "Error al conectar con Groq."
+        except Exception as e:
+            estado["respuesta"] = f"Error Groq: {str(e)[:120]}"
     return render_template_string(HTML_CHAT, respuesta=estado["respuesta"])
 
 
