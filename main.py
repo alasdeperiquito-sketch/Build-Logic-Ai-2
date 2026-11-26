@@ -128,6 +128,7 @@ def crear_canal() -> dict:
         "cola": [],
         "cursor": 0,
         "reset_pendiente": False,
+        "reset_pulsos": 0,
     }
 
 
@@ -165,6 +166,29 @@ def extraer_password_peticion() -> str:
         or ""
     ).strip()
     return query_pwd or DEFAULT_PASSWORD
+
+
+def pedir_respuesta_ia(mensaje: str) -> str:
+    for _ in range(2):
+        chat = client.chat.completions.create(
+            model=MODELO_GROQ,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Reply in English, max 35 characters, one short line, no emojis or weird symbols.",
+                },
+                {"role": "user", "content": mensaje},
+            ],
+            max_tokens=150,
+            timeout=15,
+        )
+        raw = ""
+        if chat.choices and chat.choices[0].message:
+            raw = chat.choices[0].message.content or ""
+        limpio = " ".join(raw.replace("\r", " ").replace("\n", " ").split()).strip()
+        if limpio:
+            return limpio[:40]
+    return ""
 
 
 HTML_CHAT = """
@@ -272,7 +296,10 @@ def leer_status():
     pwd = extraer_password_peticion()
     canal = get_canal(pwd, crear_si_no_existe=False)
     if canal and canal["reset_pendiente"]:
-        canal["reset_pendiente"] = False
+        canal["reset_pulsos"] += 1
+        if canal["reset_pulsos"] >= 2:
+            canal["reset_pendiente"] = False
+            canal["reset_pulsos"] = 0
         # Pin 1 = auto-reset pulse before writing new text
         return jsonify({"value": "10000000"})
     return jsonify({"value": "00000000"})
@@ -292,26 +319,13 @@ def preguntar_desde_web():
             toast_msg = "Error: Missing GROQ_API_KEY"
         else:
             try:
-                chat = client.chat.completions.create(
-                    model=MODELO_GROQ,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "Reply in English, max 35 characters, direct, no emojis or weird symbols.",
-                        },
-                        {"role": "user", "content": mensaje},
-                    ],
-                    max_tokens=120,
-                    timeout=15,
-                )
-                texto = (chat.choices[0].message.content or "").strip()
+                texto = pedir_respuesta_ia(mensaje)
                 if texto:
-                    limpio = texto[:40]
-                    canal["respuesta"] = limpio
-                    canal["cola"] = construir_cola(limpio)
+                    canal["respuesta"] = texto
+                    canal["cola"] = construir_cola(texto)
                     canal["cursor"] = 0
-                    # Trigger automatic reset on /status Pin 1 before writing this new response
                     canal["reset_pendiente"] = True
+                    canal["reset_pulsos"] = 0
                     toast_msg = f"AI replied for [{pwd}]! Auto-reset queued & bits ready."
                 else:
                     canal["respuesta"] = "Empty reply"
@@ -328,6 +342,9 @@ def leer_en_roblox():
     pwd = extraer_password_peticion()
     canal = get_canal(pwd, crear_si_no_existe=False)
     if not canal:
+        return jsonify({"value": "00000000"})
+    if canal["reset_pendiente"]:
+        # Hold writing until /status emits the reset pulse
         return jsonify({"value": "00000000"})
     idx = canal["cursor"]
     cola = canal["cola"]
