@@ -203,7 +203,7 @@ def extraer_valor_post(data: dict, form: dict) -> str:
 
 
 def pedir_respuesta_ia(mensaje: str) -> str:
-    for _ in range(2):
+    for intento in range(2):
         chat = client.chat.completions.create(
             model=MODELO_GROQ,
             messages=[
@@ -218,6 +218,7 @@ def pedir_respuesta_ia(mensaje: str) -> str:
         )
         raw = chat.choices[0].message.content if (chat.choices and chat.choices[0].message) else ""
         limpio = " ".join((raw or "").replace("\r", " ").replace("\n", " ").split()).strip()
+        print(f"[GROQ] intento={intento + 1} modelo={MODELO_GROQ} raw={raw!r} limpio={limpio!r}", flush=True)
         if limpio:
             return limpio[:40]
     return ""
@@ -225,8 +226,10 @@ def pedir_respuesta_ia(mensaje: str) -> str:
 
 def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
     canal["ultimo_enviado"] = mensaje
+    print(f"[IA-SEND] pwd={pwd} mensaje={mensaje!r} client_ok={bool(client)} model={MODELO_GROQ}", flush=True)
     if not client:
         canal["respuesta"] = "Missing GROQ_API_KEY"
+        print("[IA-ERROR] GROQ_API_KEY no configurada en el entorno", flush=True)
         return "Error: Missing GROQ_API_KEY"
     try:
         texto = pedir_respuesta_ia(mensaje)
@@ -236,12 +239,16 @@ def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
             canal["cursor"] = 0
             canal["reset_pendiente"] = True
             canal["reset_pulsos"] = 0
+            print(f"[IA-OK] pwd={pwd} respuesta={texto!r} bits_len={len(canal['cola'])}", flush=True)
             return f"AI replied for [{pwd}]! Auto-reset queued & bits ready."
         canal["respuesta"] = "Empty reply"
+        print(f"[IA-WARN] pwd={pwd} Groq devolvió vacío", flush=True)
         return "AI returned empty reply; queue unchanged."
     except Exception as e:
-        canal["respuesta"] = f"Error: {str(e)[:45]}"
-        return "Request failed; queue unchanged."
+        err_msg = f"{type(e).__name__}: {e}"
+        canal["respuesta"] = f"Error: {err_msg[:45]}"
+        print(f"[IA-EXCEPTION] pwd={pwd} {err_msg}", flush=True)
+        return f"Request failed: {err_msg[:60]}"
 
 
 HTML_CHAT = """
@@ -388,8 +395,6 @@ def recibir_teclado():
     valor = extraer_valor_post(data, form)
     bits_limpios = "".join(c for c in valor if c in ("0", "1"))
 
-    print(f"[TECLADO] method={request.method} pwd={pwd} raw_val={valor!r} bits={bits_limpios!r}", flush=True)
-
     if valor:
         canal["ultimo_packet_teclado"] = valor
 
@@ -403,6 +408,8 @@ def recibir_teclado():
             if texto_envio:
                 canal["borrador_teclado"] = ""
                 enviar_a_ia(canal, pwd, texto_envio)
+            else:
+                print(f"[TECLADO] pin_send=1 pero borrador vacio en pwd={pwd}", flush=True)
         elif pin_shift == "1" and bits_char == "000000":
             canal["borrador_teclado"] = canal["borrador_teclado"][:-1]
         else:
@@ -420,6 +427,11 @@ def recibir_teclado():
         canal["borrador_teclado"] = (canal["borrador_teclado"] + CODIGOS_SIMPLES[valor])[:60]
     elif len(valor) == 1 and valor in MAPA_CARACTERES:
         canal["borrador_teclado"] = (canal["borrador_teclado"] + valor)[:60]
+
+    print(
+        f"[TECLADO] method={request.method} pwd={pwd} raw_val={valor!r} bits={bits_limpios!r} draft={canal['borrador_teclado']!r}",
+        flush=True,
+    )
 
     return jsonify({"value": "00000000"})
 
