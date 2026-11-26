@@ -5,7 +5,7 @@ from groq import Groq
 app = Flask(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-MODELO_GROQ = os.environ.get("MODELO_GROQ", "").strip() or "llama-3.1-8b-instant"
+MODELO_GROQ = os.environ.get("MODELO_GROQ", "").strip()
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # Each entry: (6_bits_character, bit_shift)
@@ -190,7 +190,7 @@ def preguntar_desde_web():
                         },
                         {"role": "user", "content": mensaje},
                     ],
-                    max_tokens=25,
+                    max_tokens=120,
                     timeout=10,
                 )
                 texto = (chat.choices[0].message.content or "").strip() or "No response"
