@@ -16,18 +16,13 @@ ACCESS_KEY = os.environ.get("ACCESS_KEY", "cambia-esta-clave-123").strip()
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 DEFAULT_PASSWORD = "1234"
-RESET_TIMEOUT_SEG = 8  # si el juego no llama a /status, el reset se cancela solo
-DEBOUNCE_SEG = 1.2     # el bloque repite el mismo POST varias veces/seg: se cuenta una vez
-# Paquete que significa "ENVIAR a la IA" (valid=1, shift=0, 6 bits = 111111).
-# Es un codigo que no usa ninguna letra. Puedes cambiarlo con la variable SEND_PACKET.
+RESET_TIMEOUT_SEG = 8
+DEBOUNCE_SEG = 1.2
 SEND_PACKET = os.environ.get("SEND_PACKET", "10111111").strip()
 LOCK = threading.RLock()
 
-# ---------------------------------------------------------------------------
-# Tabla de caracteres: (6 bits, shift)
-# ---------------------------------------------------------------------------
-_BASE = " abcdefghijklmnopqrstuvwxyz1234567890-=.,;/"  # el indice = codigo
-_SHIFT = "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%?&*()_+"      # indice + 1 = codigo
+_BASE = " abcdefghijklmnopqrstuvwxyz1234567890-=.,;/"
+_SHIFT = "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%?&*()_+"
 
 MAPA_CARACTERES = {ch: (format(i, "06b"), "0") for i, ch in enumerate(_BASE)}
 MAPA_CARACTERES.update({ch: (format(i + 1, "06b"), "1") for i, ch in enumerate(_SHIFT)})
@@ -48,7 +43,6 @@ def normalizar_8bits(codigo: str) -> str:
 
 
 def limpiar_texto(texto: str) -> str:
-    """Quita acentos y cambia a espacio lo que la pantalla no puede mostrar."""
     texto = texto.replace("¿", "?").replace("¡", "!")
     for comilla in ("'", '"', "’", "‘", "“", "”", "`"):
         texto = texto.replace(comilla, "")
@@ -66,9 +60,6 @@ def texto_a_8bits(texto: str) -> list[str]:
     return salida
 
 
-# ---------------------------------------------------------------------------
-# Estado
-# ---------------------------------------------------------------------------
 def crear_canal() -> dict:
     return {
         "ultimo_enviado": "",
@@ -149,9 +140,6 @@ def extraer_valor_post(data: dict, form: dict) -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# IA
-# ---------------------------------------------------------------------------
 def pedir_respuesta_ia(mensaje: str) -> str:
     for intento in range(2):
         instruccion = (
@@ -188,7 +176,7 @@ def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
         print("[IA-ERROR] GROQ_API_KEY no configurada en el entorno", flush=True)
         return "Error: Missing GROQ_API_KEY"
     try:
-        texto = pedir_respuesta_ia(mensaje)  # llamada lenta: fuera del lock
+        texto = pedir_respuesta_ia(mensaje)
         if texto:
             with LOCK:
                 canal["respuesta"] = texto
@@ -200,9 +188,14 @@ def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
             print(f"[IA-OK] pwd={pwd} respuesta={texto!r} bits_len={len(canal['cola'])}", flush=True)
             return f"AI replied for [{pwd}]! Auto-reset queued & bits ready."
         with LOCK:
-            canal["respuesta"] = "Empty reply"
-        print(f"[IA-WARN] pwd={pwd} Groq devolvio vacio", flush=True)
-        return "AI returned empty reply; queue unchanged."
+            canal["respuesta"] = "OK"
+            canal["cola"] = texto_a_8bits("OK")
+            canal["cursor"] = 0
+            canal["reset_pendiente"] = True
+            canal["reset_pulsos"] = 0
+            canal["reset_deadline"] = time.time() + RESET_TIMEOUT_SEG
+        print(f"[IA-WARN] pwd={pwd} Groq devolvio vacio; usando OK", flush=True)
+        return f"AI replied OK for [{pwd}]! Auto-reset queued & bits ready."
     except Exception as e:
         err_msg = f"{type(e).__name__}: {e}"
         with LOCK:
@@ -211,9 +204,6 @@ def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
         return f"Request failed: {err_msg[:60]}"
 
 
-# ---------------------------------------------------------------------------
-# Web
-# ---------------------------------------------------------------------------
 HTML_CHAT = """
 <!doctype html>
 <html lang="en">
@@ -375,7 +365,7 @@ def recibir_teclado():
             canal["ultimo_packet_teclado"] = valor
 
         if len(bits_limpios) == 8 and len(valor) == 8:
-            pin_valid = bits_limpios[0]   # 1 = "hay tecla" (igual que en /ia)
+            pin_valid = bits_limpios[0]
             pin_shift = bits_limpios[1]
             bits_char = bits_limpios[2:]
             ahora = time.time()
@@ -392,7 +382,9 @@ def recibir_teclado():
                 if bits_limpios == SEND_PACKET:
                     texto_envio = canal["borrador_teclado"].strip()
                     canal["borrador_teclado"] = ""
-                    if not texto_envio:
+                    if texto_envio:
+                        print(f"[TECLADO] enviando a IA desde teclado en pwd={pwd}: {texto_envio!r}", flush=True)
+                    else:
                         print(f"[TECLADO] enviar pulsado pero borrador vacio en pwd={pwd}", flush=True)
                 elif pin_shift == "1" and bits_char == "000000":
                     canal["borrador_teclado"] = canal["borrador_teclado"][:-1]
