@@ -79,9 +79,9 @@ def crear_canal() -> dict:
 
 canales: dict[str, dict] = {
     DEFAULT_PASSWORD: crear_canal(),
-    "5467": crear_canal(),
+    "1234": crear_canal(),
 }
-ui_state = {"active_password": "5467", "toast": ""}
+ui_state = {"active_password": "1234", "toast": ""}
 
 
 def get_canal(password: str, crear_si_no_existe: bool = True) -> dict | None:
