@@ -6,6 +6,7 @@ app = Flask(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 MODELO_GROQ = os.environ.get("MODELO_GROQ", "").strip() or "llama-3.1-8b-instant"
+ACCESS_KEY = os.environ.get("ACCESS_KEY", "cambia-esta-clave-123").strip()
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 DEFAULT_PASSWORD = "1234"
@@ -96,6 +97,15 @@ MAPA_CARACTERES = {
     ":": ("101001", "1"),
 }
 
+INVERSO_6BITS = {
+    (bits_char, bit_shift): ch
+    for ch, (bits_char, bit_shift) in MAPA_CARACTERES.items()
+}
+
+# Simple numeric codes: 0 = space, 1..26 = a..z, 99 = backspace, 100 = send
+CODIGOS_SIMPLES = {str(i + 1): chr(97 + i) for i in range(26)}
+CODIGOS_SIMPLES["0"] = " "
+
 
 def normalizar_8bits(codigo: str) -> str:
     limpio = "".join(c for c in codigo if c in ("0", "1"))
@@ -124,6 +134,9 @@ def construir_cola(texto: str) -> list[str]:
 
 def crear_canal() -> dict:
     return {
+        "ultimo_enviado": "",
+        "borrador_teclado": "",
+        "ultimo_packet_teclado": "",
         "respuesta": "Ready",
         "cola": [],
         "cursor": 0,
@@ -168,6 +181,22 @@ def extraer_password_peticion() -> str:
     return query_pwd or DEFAULT_PASSWORD
 
 
+def extraer_valor_post(data: dict, form: dict) -> str:
+    for candidato in (
+        data.get("value"),
+        data.get("bits8"),
+        data.get("code"),
+        data.get("char"),
+        form.get("value"),
+        form.get("bits8"),
+        form.get("code"),
+        form.get("char"),
+    ):
+        if candidato is not None:
+            return str(candidato).strip()
+    return (request.get_data(as_text=True) or "").strip()
+
+
 def pedir_respuesta_ia(mensaje: str) -> str:
     for _ in range(2):
         chat = client.chat.completions.create(
@@ -191,14 +220,35 @@ def pedir_respuesta_ia(mensaje: str) -> str:
     return ""
 
 
+def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
+    canal["ultimo_enviado"] = mensaje
+    if not client:
+        canal["respuesta"] = "Missing GROQ_API_KEY"
+        return "Error: Missing GROQ_API_KEY"
+    try:
+        texto = pedir_respuesta_ia(mensaje)
+        if texto:
+            canal["respuesta"] = texto
+            canal["cola"] = construir_cola(texto)
+            canal["cursor"] = 0
+            canal["reset_pendiente"] = True
+            canal["reset_pulsos"] = 0
+            return f"AI replied for [{pwd}]! Auto-reset queued & bits ready."
+        canal["respuesta"] = "Empty reply"
+        return "AI returned empty reply; queue unchanged."
+    except Exception as e:
+        canal["respuesta"] = f"Error: {str(e)[:45]}"
+        return "Request failed; queue unchanged."
+
+
 HTML_CHAT = """
 <!doctype html>
 <html lang="en">
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AI Chat - Build Logic</title>
+  <title>AI Receiver & Sender - Build Logic</title>
   <style>
-    body { font-family: sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px 80px 16px; background: #111; color: #eee; }
+    body { font-family: sans-serif; max-width: 540px; margin: 36px auto; padding: 0 16px 80px 16px; background: #111; color: #eee; }
     label { display: block; margin-top: 12px; font-size: 14px; color: #bbb; }
     input, button { width: 100%; padding: 12px; margin-top: 6px; font-size: 16px; border-radius: 8px; border: none; box-sizing: border-box; }
     input { background: #222; color: #fff; }
@@ -221,13 +271,16 @@ HTML_CHAT = """
   </style>
 </head>
 <body>
-  <h2>Talk to AI in Build Logic</h2>
+  <h2>AI Receiver & Sender</h2>
   <form method="POST" action="/preguntar" onsubmit="showSending()">
-    <label for="password">Screen Password (matches HTTP Transmitter Header: Password: ...)</label>
-    <input type="text" id="password" name="password" value="{{ password }}" placeholder="e.g. 1234" required>
-    <div class="hint">In Build Logic HTTP Transmitter Headers put: Password: {{ password }}</div>
+    <label for="access_key">Owner Access Key</label>
+    <input type="password" id="access_key" name="access_key" placeholder="Enter your private access key" required>
 
-    <label for="mensaje">Message</label>
+    <label for="password">Screen Password (Header: Password: ...)</label>
+    <input type="text" id="password" name="password" value="{{ password }}" placeholder="e.g. 1234" required>
+    <div class="hint">Build Logic Header: Password: {{ password }}</div>
+
+    <label for="mensaje">Send Message</label>
     <input type="text" id="mensaje" name="mensaje" placeholder="Type your question here..." required autofocus>
 
     <button type="submit" id="sendBtn">Send to Roblox</button>
@@ -236,9 +289,13 @@ HTML_CHAT = """
   <div class="box">
     <strong>Screen Password:</strong>
     <p>{{ password }}</p>
-    <strong>Model:</strong>
-    <p>{{ modelo }}</p>
-    <strong>Latest response:</strong>
+    <strong>Last keypad packet / code:</strong>
+    <p>{{ ultimo_packet_teclado }}</p>
+    <strong>Keypad draft:</strong>
+    <p>{{ borrador_teclado }}</p>
+    <strong>Last sent:</strong>
+    <p>{{ ultimo_enviado }}</p>
+    <strong>Latest received response:</strong>
     <p>{{ respuesta }}</p>
     <strong>Queue progress:</strong>
     <p>{{ cursor }} / {{ total }}</p>
@@ -274,7 +331,9 @@ def render_page(password: str, toast_msg: str = ""):
     return render_template_string(
         HTML_CHAT,
         password=pwd,
-        modelo=MODELO_GROQ,
+        ultimo_packet_teclado=canal["ultimo_packet_teclado"] or "(none)",
+        borrador_teclado=canal["borrador_teclado"] or "(empty)",
+        ultimo_enviado=canal["ultimo_enviado"] or "(none)",
         respuesta=canal["respuesta"],
         cursor=canal["cursor"],
         total=len(canal["cola"]),
@@ -300,41 +359,84 @@ def leer_status():
         if canal["reset_pulsos"] >= 2:
             canal["reset_pendiente"] = False
             canal["reset_pulsos"] = 0
-        # Pin 1 = auto-reset pulse before writing new text
         return jsonify({"value": "10000000"})
     return jsonify({"value": "00000000"})
 
 
 @app.route("/preguntar", methods=["POST"])
 def preguntar_desde_web():
+    key_introducida = request.form.get("access_key", "").strip()
     pwd = request.form.get("password", "").strip() or DEFAULT_PASSWORD
     mensaje = request.form.get("mensaje", "").strip()
     ui_state["active_password"] = pwd
     canal = get_canal(pwd, crear_si_no_existe=True)
     toast_msg = ""
 
+    if ACCESS_KEY and key_introducida != ACCESS_KEY:
+        toast_msg = "Invalid access key! Prompt blocked."
+        return render_page(pwd, toast_msg)
+
     if mensaje:
-        if not client:
-            canal["respuesta"] = "Missing GROQ_API_KEY"
-            toast_msg = "Error: Missing GROQ_API_KEY"
-        else:
-            try:
-                texto = pedir_respuesta_ia(mensaje)
-                if texto:
-                    canal["respuesta"] = texto
-                    canal["cola"] = construir_cola(texto)
-                    canal["cursor"] = 0
-                    canal["reset_pendiente"] = True
-                    canal["reset_pulsos"] = 0
-                    toast_msg = f"AI replied for [{pwd}]! Auto-reset queued & bits ready."
-                else:
-                    canal["respuesta"] = "Empty reply"
-                    toast_msg = "AI returned empty reply; queue unchanged."
-            except Exception as e:
-                canal["respuesta"] = f"Error: {str(e)[:45]}"
-                toast_msg = "Request failed; queue unchanged."
+        toast_msg = enviar_a_ia(canal, pwd, mensaje)
 
     return render_page(pwd, toast_msg)
+
+
+@app.route("/teclado", methods=["POST"])
+def recibir_teclado():
+    data = request.get_json(silent=True) or {}
+    form = request.form or {}
+    pwd = (
+        request.headers.get("Password")
+        or request.headers.get("X-Password")
+        or data.get("password")
+        or form.get("password")
+        or DEFAULT_PASSWORD
+    ).strip() or DEFAULT_PASSWORD
+
+    canal = get_canal(pwd, crear_si_no_existe=True)
+    valor = extraer_valor_post(data, form)
+    bits_limpios = "".join(c for c in valor if c in ("0", "1"))
+
+    if valor:
+        canal["ultimo_packet_teclado"] = valor
+
+    if len(bits_limpios) == 8 and set(valor) <= {"0", "1"}:
+        pin_send = bits_limpios[0]
+        pin_shift = bits_limpios[1]
+        bits_char = bits_limpios[2:]
+
+        if pin_send == "1":
+            texto_envio = canal["borrador_teclado"].strip()
+            if texto_envio:
+                canal["borrador_teclado"] = ""
+                enviar_a_ia(canal, pwd, texto_envio)
+        elif pin_shift == "1" and bits_char == "000000":
+            canal["borrador_teclado"] = canal["borrador_teclado"][:-1]
+        else:
+            ch_decoded = INVERSO_6BITS.get((bits_char, pin_shift), "")
+            if ch_decoded:
+                canal["borrador_teclado"] = (canal["borrador_teclado"] + ch_decoded)[:60]
+    elif valor == "100":
+        texto_envio = canal["borrador_teclado"].strip()
+        if texto_envio:
+            canal["borrador_teclado"] = ""
+            enviar_a_ia(canal, pwd, texto_envio)
+    elif valor == "99":
+        canal["borrador_teclado"] = canal["borrador_teclado"][:-1]
+    elif valor in CODIGOS_SIMPLES:
+        canal["borrador_teclado"] = (canal["borrador_teclado"] + CODIGOS_SIMPLES[valor])[:60]
+    elif len(valor) == 1 and valor in MAPA_CARACTERES:
+        canal["borrador_teclado"] = (canal["borrador_teclado"] + valor)[:60]
+
+    return jsonify({
+        "value": "00000000",
+        "ok": True,
+        "password": pwd,
+        "draft": canal["borrador_teclado"],
+        "last_sent": canal["ultimo_enviado"],
+        "response": canal["respuesta"],
+    })
 
 
 @app.route("/ia", methods=["GET"])
@@ -344,7 +446,6 @@ def leer_en_roblox():
     if not canal:
         return jsonify({"value": "00000000"})
     if canal["reset_pendiente"]:
-        # Hold writing until /status emits the reset pulse
         return jsonify({"value": "00000000"})
     idx = canal["cursor"]
     cola = canal["cola"]
