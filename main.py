@@ -18,6 +18,7 @@ client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 DEFAULT_PASSWORD = "1234"
 RESET_TIMEOUT_SEG = 8
 DEBOUNCE_SEG = 1.2
+MAX_RESPUESTA_CHARS = int(os.environ.get("MAX_RESPUESTA_CHARS", "160"))
 SEND_PACKET = os.environ.get("SEND_PACKET", "10111111").strip()
 LOCK = threading.RLock()
 
@@ -143,11 +144,13 @@ def extraer_valor_post(data: dict, form: dict) -> str:
 def pedir_respuesta_ia(mensaje: str) -> str:
     for intento in range(2):
         instruccion = (
-            "Reply in English, max 35 characters, one short line. "
-            "Use only letters, numbers and basic punctuation. "
-            "No emojis, no quotes, no weird symbols."
+            f"You are a helpful AI assistant connected to a screen. "
+            f"Answer any question, topic, calculation, or message directly and completely "
+            f"in the same language the user wrote in (Spanish, English, etc.). "
+            f"Keep the answer clear and concise, maximum {MAX_RESPUESTA_CHARS} characters, "
+            f"in a single plain line with no emojis or markdown."
             if intento == 0
-            else "Reply with a short plain English answer under 30 characters."
+            else f"Answer the user directly in their same language in under {MAX_RESPUESTA_CHARS} plain characters."
         )
         chat = client.chat.completions.create(
             model=MODELO_GROQ,
@@ -155,14 +158,14 @@ def pedir_respuesta_ia(mensaje: str) -> str:
                 {"role": "system", "content": instruccion},
                 {"role": "user", "content": mensaje},
             ],
-            max_tokens=120,
+            max_tokens=250,
             timeout=15,
         )
         raw = chat.choices[0].message.content if (chat.choices and chat.choices[0].message) else ""
         limpio = limpiar_texto(raw or "")
         print(f"[GROQ] intento={intento + 1} modelo={MODELO_GROQ} raw={raw!r} limpio={limpio!r}", flush=True)
         if limpio:
-            return limpio[:40]
+            return limpio[:MAX_RESPUESTA_CHARS]
     return "OK"
 
 
@@ -372,8 +375,10 @@ def recibir_teclado():
 
             if bits_limpios == "00000000":
                 canal["ultimo_paquete"] = ""
-            elif (bits_limpios == canal["ultimo_paquete"]
-                  and ahora - canal["ultimo_paquete_t"] < DEBOUNCE_SEG):
+            elif (
+                bits_limpios == canal["ultimo_paquete"]
+                and ahora - canal["ultimo_paquete_t"] < DEBOUNCE_SEG
+            ):
                 canal["ultimo_paquete_t"] = ahora
             else:
                 canal["ultimo_paquete"] = bits_limpios
@@ -393,7 +398,7 @@ def recibir_teclado():
                 else:
                     ch_decoded = INVERSO_6BITS.get((bits_char, pin_shift), "")
                     if ch_decoded:
-                        canal["borrador_teclado"] = (canal["borrador_teclado"] + ch_decoded)[:60]
+                        canal["borrador_teclado"] = (canal["borrador_teclado"] + ch_decoded)[:120]
                     else:
                         print(f"[TECLADO] codigo sin caracter: {bits_limpios}", flush=True)
         elif valor == "100":
@@ -402,15 +407,14 @@ def recibir_teclado():
         elif valor == "99":
             canal["borrador_teclado"] = canal["borrador_teclado"][:-1]
         elif valor in CODIGOS_SIMPLES:
-            canal["borrador_teclado"] = (canal["borrador_teclado"] + CODIGOS_SIMPLES[valor])[:60]
+            canal["borrador_teclado"] = (canal["borrador_teclado"] + CODIGOS_SIMPLES[valor])[:120]
         elif len(valor) == 1 and valor in MAPA_CARACTERES:
-            canal["borrador_teclado"] = (canal["borrador_teclado"] + valor)[:60]
+            canal["borrador_teclado"] = (canal["borrador_teclado"] + valor)[:120]
+
+        draft_actual = canal["borrador_teclado"]
 
     if texto_envio:
         enviar_a_ia(canal, pwd, texto_envio)
-
-    with LOCK:
-        draft_actual = canal["borrador_teclado"]
 
     print(
         f"[TECLADO] method={request.method} pwd={pwd} raw_val={valor!r} "
