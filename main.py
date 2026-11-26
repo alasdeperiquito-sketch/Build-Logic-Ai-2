@@ -236,7 +236,7 @@ HTML_CHAT = """
     <input type="password" id="access_key" name="access_key" placeholder="Enter your private access key" required>
 
     <label for="password">Screen Password (Header: Password: ...)</label>
-    <input type="text" id="password" name="password" value="{{ password }}" placeholder="e.g. 5467" required>
+    <input type="text" id="password" name="password" value="{{ password }}" placeholder="e.g. 1234" required>
     <div class="hint">Build Logic Header: Password: {{ password }}</div>
 
     <label for="mensaje">Send Message</label>
