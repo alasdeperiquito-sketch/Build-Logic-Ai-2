@@ -5,7 +5,7 @@ from groq import Groq
 app = Flask(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-MODELO_GROQ = os.environ.get("openai/gpt-oss-20b", "").strip()
+MODELO_GROQ = os.environ.get("MODELO_GROQ", "").strip()
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # Cada entrada: (6_bits_caracter, bit_shift)
