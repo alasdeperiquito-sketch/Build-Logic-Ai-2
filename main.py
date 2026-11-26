@@ -8,6 +8,8 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 MODELO_GROQ = os.environ.get("MODELO_GROQ", "").strip() or "llama-3.1-8b-instant"
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
+DEFAULT_PASSWORD = "1234"
+
 # Each entry: (6_bits_character, bit_shift)
 MAPA_CARACTERES = {
     " ": ("000000", "0"),
@@ -120,14 +122,50 @@ def construir_cola(texto: str) -> list[str]:
     return texto_a_8bits(texto)
 
 
-estado = {
-    "respuesta": "Ready",
-    "cola": [],
-    "cursor": 0,
-    "modelo": MODELO_GROQ,
-    "toast": "",
-    "reset_pendiente": False,
+def crear_canal() -> dict:
+    return {
+        "respuesta": "Ready",
+        "cola": [],
+        "cursor": 0,
+        "reset_pendiente": False,
+    }
+
+
+canales: dict[str, dict] = {
+    DEFAULT_PASSWORD: crear_canal()
 }
+
+ui_state = {
+    "active_password": DEFAULT_PASSWORD,
+    "toast": "",
+}
+
+
+def get_canal(password: str, crear_si_no_existe: bool = True) -> dict | None:
+    pwd = (password or "").strip() or DEFAULT_PASSWORD
+    if pwd not in canales:
+        if not crear_si_no_existe:
+            return None
+        canales[pwd] = crear_canal()
+    return canales[pwd]
+
+
+def extraer_password_peticion() -> str:
+    header_pwd = (
+        request.headers.get("Password")
+        or request.headers.get("X-Password")
+        or ""
+    ).strip()
+    if header_pwd:
+        return header_pwd
+    query_pwd = (
+        request.args.get("password")
+        or request.args.get("code")
+        or request.args.get("id")
+        or ""
+    ).strip()
+    return query_pwd or DEFAULT_PASSWORD
+
 
 HTML_CHAT = """
 <!doctype html>
@@ -137,10 +175,11 @@ HTML_CHAT = """
   <title>AI Chat - Build Logic</title>
   <style>
     body { font-family: sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px 80px 16px; background: #111; color: #eee; }
-    input, button { width: 100%; padding: 12px; margin-top: 10px; font-size: 16px; border-radius: 8px; border: none; box-sizing: border-box; }
+    label { display: block; margin-top: 12px; font-size: 14px; color: #bbb; }
+    input, button { width: 100%; padding: 12px; margin-top: 6px; font-size: 16px; border-radius: 8px; border: none; box-sizing: border-box; }
     input { background: #222; color: #fff; }
-    button { background: #2563eb; color: white; font-weight: bold; cursor: pointer; }
-    button.reset-btn { background: #b91c1c; }
+    button { background: #2563eb; color: white; font-weight: bold; cursor: pointer; margin-top: 14px; }
+    .hint { font-size: 12px; color: #9ca3af; margin-top: 4px; }
     .box { margin-top: 20px; padding: 14px; background: #1e1e1e; border-radius: 8px; word-break: break-all; }
     .toast {
       position: fixed;
@@ -160,13 +199,19 @@ HTML_CHAT = """
 <body>
   <h2>Talk to AI in Build Logic</h2>
   <form method="POST" action="/preguntar" onsubmit="showSending()">
-    <input type="text" name="mensaje" placeholder="Type your question here..." required autofocus>
+    <label for="password">Screen Password (matches HTTP Transmitter Header: Password: ...)</label>
+    <input type="text" id="password" name="password" value="{{ password }}" placeholder="e.g. 1234" required>
+    <div class="hint">In Build Logic HTTP Transmitter Headers put: Password: {{ password }}</div>
+
+    <label for="mensaje">Message</label>
+    <input type="text" id="mensaje" name="mensaje" placeholder="Type your question here..." required autofocus>
+
     <button type="submit" id="sendBtn">Send to Roblox</button>
   </form>
-  <form method="POST" action="/reset">
-    <button type="submit" class="reset-btn">Reset Screen & Queue</button>
-  </form>
+
   <div class="box">
+    <strong>Screen Password:</strong>
+    <p>{{ password }}</p>
     <strong>Model:</strong>
     <p>{{ modelo }}</p>
     <strong>Latest response:</strong>
@@ -186,7 +231,7 @@ HTML_CHAT = """
       btn.innerText = "Waiting for AI...";
       const t = document.getElementById("liveToast");
       t.style.background = "#2563eb";
-      t.innerText = "Sent! Waiting for AI response before sending bits...";
+      t.innerText = "Sent! Waiting for AI response before auto-resetting and sending bits...";
       t.style.display = "block";
     }
     const initialToast = document.getElementById("liveToast");
@@ -199,51 +244,51 @@ HTML_CHAT = """
 """
 
 
-def render_page(toast_msg: str = ""):
+def render_page(password: str, toast_msg: str = ""):
+    pwd = (password or "").strip() or DEFAULT_PASSWORD
+    canal = get_canal(pwd, crear_si_no_existe=True)
     return render_template_string(
         HTML_CHAT,
-        modelo=estado["modelo"],
-        respuesta=estado["respuesta"],
-        cursor=estado["cursor"],
-        total=len(estado["cola"]),
-        bits=" ".join(estado["cola"]) if estado["cola"] else "(empty)",
+        password=pwd,
+        modelo=MODELO_GROQ,
+        respuesta=canal["respuesta"],
+        cursor=canal["cursor"],
+        total=len(canal["cola"]),
+        bits=" ".join(canal["cola"]) if canal["cola"] else "(empty)",
         toast=toast_msg,
     )
 
 
 @app.route("/", methods=["GET"])
 def web_chat():
-    msg = estado["toast"]
-    estado["toast"] = ""
-    return render_page(msg)
-
-
-@app.route("/reset", methods=["POST", "GET"])
-def reset_queue():
-    estado["cola"] = []
-    estado["cursor"] = 0
-    estado["respuesta"] = "Reset"
-    estado["reset_pendiente"] = True
-    estado["toast"] = "Reset queued on /status (Pin 1)!"
-    return render_page(estado["toast"])
+    pwd = request.args.get("password", "").strip() or ui_state["active_password"]
+    msg = ui_state["toast"]
+    ui_state["toast"] = ""
+    return render_page(pwd, msg)
 
 
 @app.route("/status", methods=["GET"])
 def leer_status():
-    pin1 = "1" if estado["reset_pendiente"] else "0"
-    if estado["reset_pendiente"]:
-        estado["reset_pendiente"] = False
-    # Pin 1 = reset pulse, Pins 2-8 reserved for future signals
-    return jsonify({"value": normalizar_8bits(f"{pin1}0000000")})
+    pwd = extraer_password_peticion()
+    canal = get_canal(pwd, crear_si_no_existe=False)
+    if canal and canal["reset_pendiente"]:
+        canal["reset_pendiente"] = False
+        # Pin 1 = auto-reset pulse before writing new text
+        return jsonify({"value": "10000000"})
+    return jsonify({"value": "00000000"})
 
 
 @app.route("/preguntar", methods=["POST"])
 def preguntar_desde_web():
+    pwd = request.form.get("password", "").strip() or DEFAULT_PASSWORD
     mensaje = request.form.get("mensaje", "").strip()
+    ui_state["active_password"] = pwd
+    canal = get_canal(pwd, crear_si_no_existe=True)
     toast_msg = ""
+
     if mensaje:
         if not client:
-            estado["respuesta"] = "Missing GROQ_API_KEY"
+            canal["respuesta"] = "Missing GROQ_API_KEY"
             toast_msg = "Error: Missing GROQ_API_KEY"
         else:
             try:
@@ -262,26 +307,33 @@ def preguntar_desde_web():
                 texto = (chat.choices[0].message.content or "").strip()
                 if texto:
                     limpio = texto[:40]
-                    estado["respuesta"] = limpio
-                    estado["cola"] = construir_cola(limpio)
-                    estado["cursor"] = 0
-                    toast_msg = "AI replied! Bits ready for Roblox."
+                    canal["respuesta"] = limpio
+                    canal["cola"] = construir_cola(limpio)
+                    canal["cursor"] = 0
+                    # Trigger automatic reset on /status Pin 1 before writing this new response
+                    canal["reset_pendiente"] = True
+                    toast_msg = f"AI replied for [{pwd}]! Auto-reset queued & bits ready."
                 else:
-                    estado["respuesta"] = "Empty reply"
+                    canal["respuesta"] = "Empty reply"
                     toast_msg = "AI returned empty reply; queue unchanged."
             except Exception as e:
-                estado["respuesta"] = f"Error: {str(e)[:45]}"
+                canal["respuesta"] = f"Error: {str(e)[:45]}"
                 toast_msg = "Request failed; queue unchanged."
-    return render_page(toast_msg)
+
+    return render_page(pwd, toast_msg)
 
 
 @app.route("/ia", methods=["GET"])
 def leer_en_roblox():
-    idx = estado["cursor"]
-    cola = estado["cola"]
+    pwd = extraer_password_peticion()
+    canal = get_canal(pwd, crear_si_no_existe=False)
+    if not canal:
+        return jsonify({"value": "00000000"})
+    idx = canal["cursor"]
+    cola = canal["cola"]
     if idx < len(cola):
         codigo = normalizar_8bits(cola[idx])
-        estado["cursor"] = idx + 1
+        canal["cursor"] = idx + 1
         return jsonify({"value": codigo})
     return jsonify({"value": "00000000"})
 
