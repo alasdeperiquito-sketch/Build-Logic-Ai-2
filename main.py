@@ -123,7 +123,6 @@ def texto_a_8bits(texto: str) -> list[str]:
     for ch in texto:
         ch_limpio = reemplazos.get(ch, ch)
         bits_char, bit_shift = MAPA_CARACTERES.get(ch_limpio, ("000000", "0"))
-        # Pin 1: Writing (1) | Pin 2: Shift | Pins 3-8: 6 bits character
         salida.append(normalizar_8bits(f"1{bit_shift}{bits_char}"))
     return salida
 
