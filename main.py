@@ -5,10 +5,10 @@ from groq import Groq
 app = Flask(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-MODELO_GROQ = os.environ.get("MODELO_GROQ", "").strip()
+MODELO_GROQ = os.environ.get("MODELO_GROQ", "").strip() or "llama-3.1-8b-instant"
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# Cada entrada: (6_bits_caracter, bit_shift)
+# Each entry: (6_bits_character, bit_shift)
 MAPA_CARACTERES = {
     " ": ("000000", "0"),
     "a": ("000001", "0"),
@@ -111,28 +111,27 @@ def texto_a_8bits(texto: str) -> list[str]:
     for ch in texto:
         ch_limpio = reemplazos.get(ch, ch)
         bits_char, bit_shift = MAPA_CARACTERES.get(ch_limpio, ("000000", "0"))
-        # Pin 1: Turn on when writing (1) | Pin 2: Shift | Pines 3-8: 6 bits carácter
         salida.append(normalizar_8bits(f"1{bit_shift}{bits_char}"))
     return salida
 
 
 def construir_cola(texto: str) -> list[str]:
-    # Pin 1 en 0 (no escribiendo), Pin 2 en 0, Pines 3-8 en 0
     return [normalizar_8bits("00000000")] + texto_a_8bits(texto)
 
 
 estado = {
-    "respuesta": "Hola",
-    "cola": construir_cola("Hola"),
+    "respuesta": "Ready",
+    "cola": construir_cola("Ready"),
     "cursor": 0,
+    "modelo": MODELO_GROQ,
 }
 
 HTML_CHAT = """
 <!doctype html>
-<html lang="es">
+<html lang="en">
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Chat IA - Build Logic</title>
+  <title>AI Chat - Build Logic</title>
   <style>
     body { font-family: sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px; background: #111; color: #eee; }
     input, button { width: 100%; padding: 12px; margin-top: 10px; font-size: 16px; border-radius: 8px; border: none; }
@@ -142,15 +141,17 @@ HTML_CHAT = """
   </style>
 </head>
 <body>
-  <h2>Hablar con la IA en Build Logic</h2>
+  <h2>Talk to AI in Build Logic</h2>
   <form method="POST" action="/preguntar">
-    <input type="text" name="mensaje" placeholder="Escribe tu pregunta aquí..." required autofocus>
-    <button type="submit">Enviar a Roblox</button>
+    <input type="text" name="mensaje" placeholder="Type your question here..." required autofocus>
+    <button type="submit">Send to Roblox</button>
   </form>
   <div class="box">
-    <strong>Última respuesta:</strong>
+    <strong>Model:</strong>
+    <p>{{ modelo }}</p>
+    <strong>Latest response:</strong>
     <p>{{ respuesta }}</p>
-    <strong>Progreso cola:</strong>
+    <strong>Queue progress:</strong>
     <p>{{ cursor }} / {{ total }}</p>
     <strong>8 bits:</strong>
     <p>{{ bits }}</p>
@@ -164,6 +165,7 @@ HTML_CHAT = """
 def web_chat():
     return render_template_string(
         HTML_CHAT,
+        modelo=estado["modelo"],
         respuesta=estado["respuesta"],
         cursor=estado["cursor"],
         total=len(estado["cola"]),
@@ -176,9 +178,7 @@ def preguntar_desde_web():
     mensaje = request.form.get("mensaje", "").strip()
     if mensaje:
         if not client:
-            texto = "Configura GROQ_API_KEY"
-        elif not MODELO_GROQ:
-            texto = "Configura MODELO_GROQ"
+            texto = "Missing GROQ_API_KEY"
         else:
             try:
                 chat = client.chat.completions.create(
@@ -186,20 +186,22 @@ def preguntar_desde_web():
                     messages=[
                         {
                             "role": "system",
-                            "content": "Responde en espanol, maximo 60 caracteres, sin emojis ni simbolos raros.",
+                            "content": "Reply in English, max 35 characters, direct, no emojis or weird symbols.",
                         },
                         {"role": "user", "content": mensaje},
                     ],
-                    max_tokens=50,
+                    max_tokens=25,
+                    timeout=10,
                 )
-                texto = chat.choices[0].message.content.strip()
+                texto = (chat.choices[0].message.content or "").strip() or "No response"
             except Exception as e:
-                texto = f"Error: {str(e)[:50]}"
+                texto = f"Error: {str(e)[:45]}"
         estado["respuesta"] = texto
         estado["cola"] = construir_cola(texto)
         estado["cursor"] = 0
     return render_template_string(
         HTML_CHAT,
+        modelo=estado["modelo"],
         respuesta=estado["respuesta"],
         cursor=estado["cursor"],
         total=len(estado["cola"]),
@@ -216,3 +218,8 @@ def leer_en_roblox():
         estado["cursor"] = idx + 1
         return jsonify({"value": codigo})
     return jsonify({"value": "00000000"})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
