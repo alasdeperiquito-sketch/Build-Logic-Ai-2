@@ -190,6 +190,10 @@ def extraer_valor_post(data: dict, form: dict) -> str:
         form.get("bits8"),
         form.get("code"),
         form.get("char"),
+        request.args.get("value"),
+        request.args.get("bits8"),
+        request.args.get("code"),
+        request.args.get("char"),
     ):
         if candidato is not None:
             return str(candidato).strip()
@@ -381,7 +385,7 @@ def preguntar_desde_web():
     return render_page(pwd, toast_msg)
 
 
-@app.route("/teclado", methods=["POST"])
+@app.route("/teclado", methods=["GET", "POST"])
 def recibir_teclado():
     data = request.get_json(silent=True) or {}
     form = request.form or {}
@@ -390,12 +394,18 @@ def recibir_teclado():
         or request.headers.get("X-Password")
         or data.get("password")
         or form.get("password")
+        or request.args.get("password")
         or DEFAULT_PASSWORD
     ).strip() or DEFAULT_PASSWORD
 
     canal = get_canal(pwd, crear_si_no_existe=True)
     valor = extraer_valor_post(data, form)
     bits_limpios = "".join(c for c in valor if c in ("0", "1"))
+
+    print(
+        f"[TECLADO] method={request.method} pwd={pwd} raw_val={valor!r} bits={bits_limpios!r}",
+        flush=True,
+    )
 
     if valor:
         canal["ultimo_packet_teclado"] = valor
