@@ -5,7 +5,7 @@ from groq import Groq
 app = Flask(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-MODELO_GROQ = os.environ.get("MODELO_GROQ", "").strip()
+MODELO_GROQ = os.environ.get("MODELO_GROQ", "").strip() or "llama-3.1-8b-instant"
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # Each entry: (6_bits_character, bit_shift)
@@ -111,19 +111,22 @@ def texto_a_8bits(texto: str) -> list[str]:
     for ch in texto:
         ch_limpio = reemplazos.get(ch, ch)
         bits_char, bit_shift = MAPA_CARACTERES.get(ch_limpio, ("000000", "0"))
+        # Pin 1: Writing (1) | Pin 2: Shift | Pins 3-8: 6 bits character
         salida.append(normalizar_8bits(f"1{bit_shift}{bits_char}"))
     return salida
 
 
 def construir_cola(texto: str) -> list[str]:
-    return [normalizar_8bits("00000000")] + texto_a_8bits(texto)
+    return texto_a_8bits(texto)
 
 
 estado = {
     "respuesta": "Ready",
-    "cola": construir_cola("Ready"),
+    "cola": [],
     "cursor": 0,
     "modelo": MODELO_GROQ,
+    "toast": "",
+    "reset_pendiente": False,
 }
 
 HTML_CHAT = """
@@ -133,18 +136,35 @@ HTML_CHAT = """
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AI Chat - Build Logic</title>
   <style>
-    body { font-family: sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px; background: #111; color: #eee; }
-    input, button { width: 100%; padding: 12px; margin-top: 10px; font-size: 16px; border-radius: 8px; border: none; }
+    body { font-family: sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px 80px 16px; background: #111; color: #eee; }
+    input, button { width: 100%; padding: 12px; margin-top: 10px; font-size: 16px; border-radius: 8px; border: none; box-sizing: border-box; }
     input { background: #222; color: #fff; }
     button { background: #2563eb; color: white; font-weight: bold; cursor: pointer; }
+    button.reset-btn { background: #b91c1c; }
     .box { margin-top: 20px; padding: 14px; background: #1e1e1e; border-radius: 8px; word-break: break-all; }
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 20px;
+      transform: translateX(-50%);
+      background: #16a34a;
+      color: #fff;
+      padding: 12px 18px;
+      border-radius: 10px;
+      font-weight: bold;
+      box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+      z-index: 999;
+    }
   </style>
 </head>
 <body>
   <h2>Talk to AI in Build Logic</h2>
-  <form method="POST" action="/preguntar">
+  <form method="POST" action="/preguntar" onsubmit="showSending()">
     <input type="text" name="mensaje" placeholder="Type your question here..." required autofocus>
-    <button type="submit">Send to Roblox</button>
+    <button type="submit" id="sendBtn">Send to Roblox</button>
+  </form>
+  <form method="POST" action="/reset">
+    <button type="submit" class="reset-btn">Reset Screen & Queue</button>
   </form>
   <div class="box">
     <strong>Model:</strong>
@@ -156,29 +176,75 @@ HTML_CHAT = """
     <strong>8 bits:</strong>
     <p>{{ bits }}</p>
   </div>
+
+  <div id="liveToast" class="toast" style="{% if not toast %}display:none;{% endif %}">{{ toast }}</div>
+
+  <script>
+    function showSending() {
+      const btn = document.getElementById("sendBtn");
+      btn.disabled = true;
+      btn.innerText = "Waiting for AI...";
+      const t = document.getElementById("liveToast");
+      t.style.background = "#2563eb";
+      t.innerText = "Sent! Waiting for AI response before sending bits...";
+      t.style.display = "block";
+    }
+    const initialToast = document.getElementById("liveToast");
+    if (initialToast && initialToast.style.display !== "none") {
+      setTimeout(() => { initialToast.style.display = "none"; }, 3500);
+    }
+  </script>
 </body>
 </html>
 """
 
 
-@app.route("/", methods=["GET"])
-def web_chat():
+def render_page(toast_msg: str = ""):
     return render_template_string(
         HTML_CHAT,
         modelo=estado["modelo"],
         respuesta=estado["respuesta"],
         cursor=estado["cursor"],
         total=len(estado["cola"]),
-        bits=" ".join(estado["cola"]),
+        bits=" ".join(estado["cola"]) if estado["cola"] else "(empty)",
+        toast=toast_msg,
     )
+
+
+@app.route("/", methods=["GET"])
+def web_chat():
+    msg = estado["toast"]
+    estado["toast"] = ""
+    return render_page(msg)
+
+
+@app.route("/reset", methods=["POST", "GET"])
+def reset_queue():
+    estado["cola"] = []
+    estado["cursor"] = 0
+    estado["respuesta"] = "Reset"
+    estado["reset_pendiente"] = True
+    estado["toast"] = "Reset queued on /status (Pin 1)!"
+    return render_page(estado["toast"])
+
+
+@app.route("/status", methods=["GET"])
+def leer_status():
+    pin1 = "1" if estado["reset_pendiente"] else "0"
+    if estado["reset_pendiente"]:
+        estado["reset_pendiente"] = False
+    # Pin 1 = reset pulse, Pins 2-8 reserved for future signals
+    return jsonify({"value": normalizar_8bits(f"{pin1}0000000")})
 
 
 @app.route("/preguntar", methods=["POST"])
 def preguntar_desde_web():
     mensaje = request.form.get("mensaje", "").strip()
+    toast_msg = ""
     if mensaje:
         if not client:
-            texto = "Missing GROQ_API_KEY"
+            estado["respuesta"] = "Missing GROQ_API_KEY"
+            toast_msg = "Error: Missing GROQ_API_KEY"
         else:
             try:
                 chat = client.chat.completions.create(
@@ -191,22 +257,22 @@ def preguntar_desde_web():
                         {"role": "user", "content": mensaje},
                     ],
                     max_tokens=120,
-                    timeout=10,
+                    timeout=15,
                 )
-                texto = (chat.choices[0].message.content or "").strip() or "No response"
+                texto = (chat.choices[0].message.content or "").strip()
+                if texto:
+                    limpio = texto[:40]
+                    estado["respuesta"] = limpio
+                    estado["cola"] = construir_cola(limpio)
+                    estado["cursor"] = 0
+                    toast_msg = "AI replied! Bits ready for Roblox."
+                else:
+                    estado["respuesta"] = "Empty reply"
+                    toast_msg = "AI returned empty reply; queue unchanged."
             except Exception as e:
-                texto = f"Error: {str(e)[:45]}"
-        estado["respuesta"] = texto
-        estado["cola"] = construir_cola(texto)
-        estado["cursor"] = 0
-    return render_template_string(
-        HTML_CHAT,
-        modelo=estado["modelo"],
-        respuesta=estado["respuesta"],
-        cursor=estado["cursor"],
-        total=len(estado["cola"]),
-        bits=" ".join(estado["cola"]),
-    )
+                estado["respuesta"] = f"Error: {str(e)[:45]}"
+                toast_msg = "Request failed; queue unchanged."
+    return render_page(toast_msg)
 
 
 @app.route("/ia", methods=["GET"])
