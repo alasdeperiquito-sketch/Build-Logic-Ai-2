@@ -353,6 +353,17 @@ def web_chat():
     return render_page(pwd, msg)
 
 
+@app.route("/debug", methods=["GET"])
+def debug_estado():
+    pwd = extraer_password_peticion()
+    canal = get_canal(pwd, crear_si_no_existe=True)
+    return jsonify({
+        "password": pwd,
+        "canal": canal,
+        "canales_activos": list(canales.keys()),
+    })
+
+
 @app.route("/status", methods=["GET"])
 def leer_status():
     pwd = extraer_password_peticion()
@@ -403,7 +414,8 @@ def recibir_teclado():
     bits_limpios = "".join(c for c in valor if c in ("0", "1"))
 
     print(
-        f"[TECLADO] method={request.method} pwd={pwd} raw_val={valor!r} bits={bits_limpios!r}",
+        f"[TECLADO] method={request.method} pwd={pwd} raw_val={valor!r} bits={bits_limpios!r} "
+        f"json={data!r} form={dict(form)!r} args={dict(request.args)!r} raw_body={(request.get_data(as_text=True) or '')!r}",
         flush=True,
     )
 
