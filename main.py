@@ -154,20 +154,20 @@ def extraer_valor_post(data: dict, form: dict) -> str:
 # ---------------------------------------------------------------------------
 def pedir_respuesta_ia(mensaje: str) -> str:
     for intento in range(2):
+        instruccion = (
+            "Reply in English, max 35 characters, one short line. "
+            "Use only letters, numbers and basic punctuation. "
+            "No emojis, no quotes, no weird symbols."
+            if intento == 0
+            else "Reply with a short plain English answer under 30 characters."
+        )
         chat = client.chat.completions.create(
             model=MODELO_GROQ,
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Reply in English, max 35 characters, one short line. "
-                        "Use only letters, numbers and basic punctuation. "
-                        "No emojis, no quotes, no weird symbols."
-                    ),
-                },
+                {"role": "system", "content": instruccion},
                 {"role": "user", "content": mensaje},
             ],
-            max_tokens=60,
+            max_tokens=120,
             timeout=15,
         )
         raw = chat.choices[0].message.content if (chat.choices and chat.choices[0].message) else ""
@@ -175,14 +175,16 @@ def pedir_respuesta_ia(mensaje: str) -> str:
         print(f"[GROQ] intento={intento + 1} modelo={MODELO_GROQ} raw={raw!r} limpio={limpio!r}", flush=True)
         if limpio:
             return limpio[:40]
-    return ""
+    return "OK"
 
 
 def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
-    canal["ultimo_enviado"] = mensaje
+    with LOCK:
+        canal["ultimo_enviado"] = mensaje
     print(f"[IA-SEND] pwd={pwd} mensaje={mensaje!r} client_ok={bool(client)} model={MODELO_GROQ}", flush=True)
     if not client:
-        canal["respuesta"] = "Missing GROQ_API_KEY"
+        with LOCK:
+            canal["respuesta"] = "Missing GROQ_API_KEY"
         print("[IA-ERROR] GROQ_API_KEY no configurada en el entorno", flush=True)
         return "Error: Missing GROQ_API_KEY"
     try:
@@ -197,12 +199,14 @@ def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
                 canal["reset_deadline"] = time.time() + RESET_TIMEOUT_SEG
             print(f"[IA-OK] pwd={pwd} respuesta={texto!r} bits_len={len(canal['cola'])}", flush=True)
             return f"AI replied for [{pwd}]! Auto-reset queued & bits ready."
-        canal["respuesta"] = "Empty reply"
+        with LOCK:
+            canal["respuesta"] = "Empty reply"
         print(f"[IA-WARN] pwd={pwd} Groq devolvio vacio", flush=True)
         return "AI returned empty reply; queue unchanged."
     except Exception as e:
         err_msg = f"{type(e).__name__}: {e}"
-        canal["respuesta"] = f"Error: {err_msg[:45]}"
+        with LOCK:
+            canal["respuesta"] = f"Error: {err_msg[:45]}"
         print(f"[IA-EXCEPTION] pwd={pwd} {err_msg}", flush=True)
         return f"Request failed: {err_msg[:60]}"
 
@@ -283,25 +287,27 @@ HTML_CHAT = """
 def render_page(password: str, toast_msg: str = ""):
     pwd = (password or "").strip() or ui_state["active_password"] or DEFAULT_PASSWORD
     canal = get_canal(pwd, crear_si_no_existe=True)
-    return render_template_string(
-        HTML_CHAT,
-        password=pwd,
-        ultimo_packet_teclado=canal["ultimo_packet_teclado"] or "(none)",
-        borrador_teclado=canal["borrador_teclado"] or "(empty)",
-        ultimo_enviado=canal["ultimo_enviado"] or "(none)",
-        respuesta=canal["respuesta"],
-        cursor=canal["cursor"],
-        total=len(canal["cola"]),
-        bits=" ".join(canal["cola"]) if canal["cola"] else "(empty)",
-        toast=toast_msg,
-    )
+    with LOCK:
+        return render_template_string(
+            HTML_CHAT,
+            password=pwd,
+            ultimo_packet_teclado=canal["ultimo_packet_teclado"] or "(none)",
+            borrador_teclado=canal["borrador_teclado"] or "(empty)",
+            ultimo_enviado=canal["ultimo_enviado"] or "(none)",
+            respuesta=canal["respuesta"],
+            cursor=canal["cursor"],
+            total=len(canal["cola"]),
+            bits=" ".join(canal["cola"]) if canal["cola"] else "(empty)",
+            toast=toast_msg,
+        )
 
 
 @app.route("/", methods=["GET"])
 def web_chat():
     pwd = request.args.get("password", "").strip() or ui_state["active_password"]
-    msg = ui_state["toast"]
-    ui_state["toast"] = ""
+    with LOCK:
+        msg = ui_state["toast"]
+        ui_state["toast"] = ""
     return render_page(pwd, msg)
 
 
@@ -334,11 +340,13 @@ def preguntar_desde_web():
     canal = get_canal(pwd, crear_si_no_existe=True)
 
     if ACCESS_KEY and not hmac.compare_digest(key_introducida, ACCESS_KEY):
-        ui_state["toast"] = "Invalid access key! Prompt blocked."
+        with LOCK:
+            ui_state["toast"] = "Invalid access key! Prompt blocked."
     elif mensaje:
-        ui_state["toast"] = enviar_a_ia(canal, pwd, mensaje)
+        estado = enviar_a_ia(canal, pwd, mensaje)
+        with LOCK:
+            ui_state["toast"] = estado
 
-    # Redirect: evita que al recargar la pagina se reenvie el formulario
     return redirect(url_for("web_chat", password=pwd))
 
 
@@ -361,25 +369,22 @@ def recibir_teclado():
     valor = extraer_valor_post(data, form)
     bits_limpios = "".join(c for c in valor if c in ("0", "1"))
 
-    if valor:
-        canal["ultimo_packet_teclado"] = valor
-
     texto_envio = ""
     with LOCK:
+        if valor:
+            canal["ultimo_packet_teclado"] = valor
+
         if len(bits_limpios) == 8 and len(valor) == 8:
             pin_valid = bits_limpios[0]   # 1 = "hay tecla" (igual que en /ia)
             pin_shift = bits_limpios[1]
             bits_char = bits_limpios[2:]
             ahora = time.time()
 
-            # El bloque repite el MISMO paquete varias veces por segundo mientras
-            # esta activo. Solo contamos la primera vez; un paquete de reposo
-            # (00000000) o una pausa larga "rearman" la tecla.
             if bits_limpios == "00000000":
                 canal["ultimo_paquete"] = ""
             elif (bits_limpios == canal["ultimo_paquete"]
                   and ahora - canal["ultimo_paquete_t"] < DEBOUNCE_SEG):
-                canal["ultimo_paquete_t"] = ahora   # repetido: se ignora
+                canal["ultimo_paquete_t"] = ahora
             else:
                 canal["ultimo_paquete"] = bits_limpios
                 canal["ultimo_paquete_t"] = ahora
@@ -392,7 +397,7 @@ def recibir_teclado():
                 elif pin_shift == "1" and bits_char == "000000":
                     canal["borrador_teclado"] = canal["borrador_teclado"][:-1]
                 elif pin_valid == "0" and bits_char == "000000":
-                    pass  # reposo
+                    pass
                 else:
                     ch_decoded = INVERSO_6BITS.get((bits_char, pin_shift), "")
                     if ch_decoded:
@@ -409,13 +414,15 @@ def recibir_teclado():
         elif len(valor) == 1 and valor in MAPA_CARACTERES:
             canal["borrador_teclado"] = (canal["borrador_teclado"] + valor)[:60]
 
-    # La llamada a la IA va fuera del lock para no bloquear a los demas
     if texto_envio:
         enviar_a_ia(canal, pwd, texto_envio)
 
+    with LOCK:
+        draft_actual = canal["borrador_teclado"]
+
     print(
         f"[TECLADO] method={request.method} pwd={pwd} raw_val={valor!r} "
-        f"bits={bits_limpios!r} draft={canal['borrador_teclado']!r}",
+        f"bits={bits_limpios!r} draft={draft_actual!r}",
         flush=True,
     )
 
@@ -430,7 +437,6 @@ def leer_en_roblox():
         return jsonify({"value": "00000000"})
 
     with LOCK:
-        # Si el juego nunca llama a /status, no nos quedamos bloqueados para siempre
         if canal["reset_pendiente"] and time.time() > canal["reset_deadline"]:
             canal["reset_pendiente"] = False
             canal["reset_pulsos"] = 0
