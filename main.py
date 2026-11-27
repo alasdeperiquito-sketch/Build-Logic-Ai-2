@@ -19,8 +19,13 @@ client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 DEFAULT_PASSWORD = "1234"
 RESET_TIMEOUT_SEG = 8
 DEBOUNCE_SEG = 1.2
-MAX_RESPUESTA_CHARS = int(os.environ.get("MAX_RESPUESTA_CHARS", "160"))
+STEP_DELAY_SEG = float(os.environ.get("STEP_DELAY_SEG", "0.25"))
+MAX_RESPUESTA_CHARS = int(os.environ.get("MAX_RESPUESTA_CHARS", "120"))
 SEND_PACKET = os.environ.get("SEND_PACKET", "10111111").strip()
+# Segundos que el texto se queda en pantalla despues de la ultima letra
+# antes de que pueda empezar otra respuesta (y limpiar la pantalla).
+READ_HOLD_SEG = float(os.environ.get("READ_HOLD_SEG", "4"))
+MAX_PENDIENTES = 3
 LOCK = threading.RLock()
 
 # Cada estado en un pin distinto (8 bits):
@@ -56,8 +61,8 @@ def normalizar_8bits(codigo: str) -> str:
 
 def limpiar_texto(texto: str) -> str:
     texto = texto.replace("¿", "?").replace("¡", "!")
-    for comilla in ("'", '"', "’", "‘", "“", "”", "`"):
-        texto = texto.replace(comilla, "")
+    for comilla in ("'", '"', "’", "‘", "“", "”", "`", "\n", "\r", "\t"):
+        texto = texto.replace(comilla, " ")
     texto = unicodedata.normalize("NFKD", texto)
     texto = "".join(c for c in texto if not unicodedata.combining(c))
     texto = "".join(c if c in MAPA_CARACTERES else " " for c in texto)
@@ -80,12 +85,15 @@ def crear_canal() -> dict:
         "respuesta": "Ready",
         "cola": [],
         "cursor": 0,
+        "ultimo_avance_t": 0.0,
+        "fin_cola_t": 0.0,          # momento en que salio la ultima letra
+        "pendientes": [],           # respuestas esperando su turno
         "reset_pendiente": False,
         "reset_pulsos": 0,
         "reset_deadline": 0.0,
         "ultimo_paquete": "",
         "ultimo_paquete_t": 0.0,
-        "enviando_ia": False,
+        "ia_en_curso": 0,           # peticiones a Groq en vuelo
         "estado_actual": "updating" if UPDATING_ENV else "online",
     }
 
@@ -111,11 +119,55 @@ def get_canal(password: str, crear_si_no_existe: bool = True) -> dict | None:
         return canales[pwd]
 
 
+# ---------------------------------------------------------------------------
+# Cola de respuestas: UNA sola respuesta se escribe a la vez
+# (todas estas funciones se llaman con LOCK tomado)
+# ---------------------------------------------------------------------------
+def pantalla_ocupada(canal: dict) -> bool:
+    """True si ahora mismo hay una respuesta escribiendose o recien terminada."""
+    if canal["reset_pendiente"]:
+        return True
+    if canal["cursor"] < len(canal["cola"]):
+        return True
+    if canal["fin_cola_t"] and time.time() - canal["fin_cola_t"] < READ_HOLD_SEG:
+        return True
+    return False
+
+
+def iniciar_respuesta(canal: dict, texto: str) -> None:
+    canal["respuesta"] = texto
+    canal["cola"] = texto_a_8bits(texto)
+    canal["cursor"] = 0
+    canal["ultimo_avance_t"] = 0.0
+    canal["fin_cola_t"] = 0.0
+    canal["reset_pendiente"] = True
+    canal["reset_pulsos"] = 0
+    canal["reset_deadline"] = time.time() + RESET_TIMEOUT_SEG
+
+
+def encolar_respuesta(canal: dict, texto: str) -> None:
+    if pantalla_ocupada(canal) or canal["pendientes"]:
+        if len(canal["pendientes"]) < MAX_PENDIENTES:
+            canal["pendientes"].append(texto)
+            print(f"[COLA] respuesta en espera ({len(canal['pendientes'])})", flush=True)
+        else:
+            print("[COLA] demasiadas respuestas en espera; se descarta una", flush=True)
+    else:
+        iniciar_respuesta(canal, texto)
+
+
+def promover_pendientes(canal: dict) -> None:
+    if canal["pendientes"] and not pantalla_ocupada(canal):
+        iniciar_respuesta(canal, canal["pendientes"].pop(0))
+
+
 def calcular_estado_canal(canal: dict, consumir_reset: bool = False) -> tuple[str, str]:
     """Devuelve (etiqueta_estado, codigo_8bits) bajo LOCK."""
     if canal["reset_pendiente"] and time.time() > canal["reset_deadline"]:
         canal["reset_pendiente"] = False
         canal["reset_pulsos"] = 0
+
+    promover_pendientes(canal)
 
     if canal["reset_pendiente"]:
         if consumir_reset:
@@ -126,11 +178,11 @@ def calcular_estado_canal(canal: dict, consumir_reset: bool = False) -> tuple[st
         canal["estado_actual"] = "reset"
         return "reset", STATUS_RESET
 
-    hay_cola_pendiente = canal["cursor"] < len(canal["cola"])
     actualizandose = (
         ui_state["repo_updating"]
-        or canal["enviando_ia"]
-        or hay_cola_pendiente
+        or canal["ia_en_curso"] > 0
+        or canal["cursor"] < len(canal["cola"])
+        or bool(canal["pendientes"])
     )
     if actualizandose:
         canal["estado_actual"] = "updating"
@@ -194,7 +246,7 @@ def pedir_respuesta_ia(mensaje: str) -> str:
             f"Answer any question, topic, calculation, or message directly and completely "
             f"in the same language the user wrote in (Spanish, English, etc.). "
             f"Keep the answer clear and concise, maximum {MAX_RESPUESTA_CHARS} characters, "
-            f"in a single plain line with no emojis or markdown."
+            f"in a single plain line with no emojis, newlines, or markdown."
             if intento == 0
             else f"Answer the user directly in their same language in under {MAX_RESPUESTA_CHARS} plain characters."
         )
@@ -217,8 +269,12 @@ def pedir_respuesta_ia(mensaje: str) -> str:
 
 def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
     with LOCK:
+        # Solo una pregunta a la vez por canal: evita respuestas que se pisan
+        if canal["ia_en_curso"] > 0:
+            print(f"[IA-BUSY] pwd={pwd} pregunta ignorada: {mensaje!r}", flush=True)
+            return "AI is busy with another question, try again in a moment."
+        canal["ia_en_curso"] += 1
         canal["ultimo_enviado"] = mensaje
-        canal["enviando_ia"] = True
         canal["estado_actual"] = "updating"
     print(f"[IA-SEND] pwd={pwd} mensaje={mensaje!r} client_ok={bool(client)} model={MODELO_GROQ}", flush=True)
     try:
@@ -227,26 +283,11 @@ def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
                 canal["respuesta"] = "Missing GROQ_API_KEY"
             print("[IA-ERROR] GROQ_API_KEY no configurada en el entorno", flush=True)
             return "Error: Missing GROQ_API_KEY"
-        texto = pedir_respuesta_ia(mensaje)
-        if texto:
-            with LOCK:
-                canal["respuesta"] = texto
-                canal["cola"] = texto_a_8bits(texto)
-                canal["cursor"] = 0
-                canal["reset_pendiente"] = True
-                canal["reset_pulsos"] = 0
-                canal["reset_deadline"] = time.time() + RESET_TIMEOUT_SEG
-            print(f"[IA-OK] pwd={pwd} respuesta={texto!r} bits_len={len(canal['cola'])}", flush=True)
-            return f"AI replied for [{pwd}]! Auto-reset queued & bits ready."
+        texto = pedir_respuesta_ia(mensaje) or "OK"
         with LOCK:
-            canal["respuesta"] = "OK"
-            canal["cola"] = texto_a_8bits("OK")
-            canal["cursor"] = 0
-            canal["reset_pendiente"] = True
-            canal["reset_pulsos"] = 0
-            canal["reset_deadline"] = time.time() + RESET_TIMEOUT_SEG
-        print(f"[IA-WARN] pwd={pwd} Groq devolvio vacio; usando OK", flush=True)
-        return f"AI replied OK for [{pwd}]! Auto-reset queued & bits ready."
+            encolar_respuesta(canal, texto)
+        print(f"[IA-OK] pwd={pwd} respuesta={texto!r}", flush=True)
+        return f"AI replied for [{pwd}]!"
     except Exception as e:
         err_msg = f"{type(e).__name__}: {e}"
         with LOCK:
@@ -255,7 +296,7 @@ def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
         return f"Request failed: {err_msg[:60]}"
     finally:
         with LOCK:
-            canal["enviando_ia"] = False
+            canal["ia_en_curso"] = max(0, canal["ia_en_curso"] - 1)
             calcular_estado_canal(canal)
 
 
@@ -304,7 +345,7 @@ HTML_CHAT = """
     <strong>Keypad draft:</strong><p>{{ borrador_teclado }}</p>
     <strong>Last sent:</strong><p>{{ ultimo_enviado }}</p>
     <strong>Latest received response:</strong><p>{{ respuesta }}</p>
-    <strong>Queue progress:</strong><p>{{ cursor }} / {{ total }}</p>
+    <strong>Queue progress:</strong><p>{{ cursor }} / {{ total }} (waiting answers: {{ pendientes }})</p>
     <strong>8 bits:</strong><p>{{ bits }}</p>
   </div>
 
@@ -317,7 +358,7 @@ HTML_CHAT = """
       btn.innerText = "Waiting for AI...";
       const t = document.getElementById("liveToast");
       t.style.background = "#2563eb";
-      t.innerText = "Sent! Waiting for AI response before auto-resetting and sending bits...";
+      t.innerText = "Sent! Waiting for AI response...";
       t.style.display = "block";
     }
     const initialToast = document.getElementById("liveToast");
@@ -346,6 +387,7 @@ def render_page(password: str, toast_msg: str = ""):
             respuesta=canal["respuesta"],
             cursor=canal["cursor"],
             total=len(canal["cola"]),
+            pendientes=len(canal["pendientes"]),
             bits=" ".join(canal["cola"]) if canal["cola"] else "(empty)",
             toast=toast_msg,
         )
@@ -455,23 +497,23 @@ def recibir_teclado():
     valor = extraer_valor_post(data, form)
     bits_limpios = "".join(c for c in valor if c in ("0", "1"))
 
+    if valor:
+        canal["ultimo_packet_teclado"] = valor
+
     texto_envio = ""
     with LOCK:
-        if valor:
-            canal["ultimo_packet_teclado"] = valor
-
         if len(bits_limpios) == 8 and len(valor) == 8:
             pin_valid = bits_limpios[0]
             pin_shift = bits_limpios[1]
             bits_char = bits_limpios[2:]
             ahora = time.time()
 
+            # El bloque repite el MISMO paquete varias veces por segundo.
+            # Solo se cuenta la primera vez.
             if bits_limpios == "00000000":
                 canal["ultimo_paquete"] = ""
-            elif (
-                bits_limpios == canal["ultimo_paquete"]
-                and ahora - canal["ultimo_paquete_t"] < DEBOUNCE_SEG
-            ):
+            elif (bits_limpios == canal["ultimo_paquete"]
+                  and ahora - canal["ultimo_paquete_t"] < DEBOUNCE_SEG):
                 canal["ultimo_paquete_t"] = ahora
             else:
                 canal["ultimo_paquete"] = bits_limpios
@@ -480,11 +522,7 @@ def recibir_teclado():
                 if bits_limpios == SEND_PACKET:
                     texto_envio = canal["borrador_teclado"].strip()
                     canal["borrador_teclado"] = ""
-                    if texto_envio:
-                        canal["enviando_ia"] = True
-                        canal["estado_actual"] = "updating"
-                        print(f"[TECLADO] enviando a IA desde teclado en pwd={pwd}: {texto_envio!r}", flush=True)
-                    else:
+                    if not texto_envio:
                         print(f"[TECLADO] enviar pulsado pero borrador vacio en pwd={pwd}", flush=True)
                 elif pin_shift == "1" and bits_char == "000000":
                     canal["borrador_teclado"] = canal["borrador_teclado"][:-1]
@@ -493,31 +531,26 @@ def recibir_teclado():
                 else:
                     ch_decoded = INVERSO_6BITS.get((bits_char, pin_shift), "")
                     if ch_decoded:
-                        canal["borrador_teclado"] = (canal["borrador_teclado"] + ch_decoded)[:120]
+                        canal["borrador_teclado"] = (canal["borrador_teclado"] + ch_decoded)[:60]
                     else:
                         print(f"[TECLADO] codigo sin caracter: {bits_limpios}", flush=True)
         elif valor == "100":
             texto_envio = canal["borrador_teclado"].strip()
             canal["borrador_teclado"] = ""
-            if texto_envio:
-                canal["enviando_ia"] = True
-                canal["estado_actual"] = "updating"
         elif valor == "99":
             canal["borrador_teclado"] = canal["borrador_teclado"][:-1]
         elif valor in CODIGOS_SIMPLES:
-            canal["borrador_teclado"] = (canal["borrador_teclado"] + CODIGOS_SIMPLES[valor])[:120]
+            canal["borrador_teclado"] = (canal["borrador_teclado"] + CODIGOS_SIMPLES[valor])[:60]
         elif len(valor) == 1 and valor in MAPA_CARACTERES:
-            canal["borrador_teclado"] = (canal["borrador_teclado"] + valor)[:120]
+            canal["borrador_teclado"] = (canal["borrador_teclado"] + valor)[:60]
 
-        draft_actual = canal["borrador_teclado"]
-        calcular_estado_canal(canal)
-
+    # La llamada lenta a la IA va fuera del lock
     if texto_envio:
         enviar_a_ia(canal, pwd, texto_envio)
 
     print(
         f"[TECLADO] method={request.method} pwd={pwd} raw_val={valor!r} "
-        f"bits={bits_limpios!r} draft={draft_actual!r}",
+        f"bits={bits_limpios!r} draft={canal['borrador_teclado']!r}",
         flush=True,
     )
 
@@ -532,22 +565,23 @@ def leer_en_roblox():
         return jsonify({"value": "00000000"})
 
     with LOCK:
-        if canal["reset_pendiente"] and time.time() > canal["reset_deadline"]:
-            canal["reset_pendiente"] = False
-            canal["reset_pulsos"] = 0
+        calcular_estado_canal(canal)   # caduca resets y arranca la siguiente respuesta en espera
 
         if canal["reset_pendiente"]:
-            calcular_estado_canal(canal)
             return jsonify({"value": "00000000"})
 
         idx = canal["cursor"]
         cola = canal["cola"]
         if idx < len(cola):
+            ahora = time.time()
+            if ahora - canal["ultimo_avance_t"] < STEP_DELAY_SEG:
+                return jsonify({"value": "00000000"})
             codigo = normalizar_8bits(cola[idx])
             canal["cursor"] = idx + 1
-            calcular_estado_canal(canal)
+            canal["ultimo_avance_t"] = ahora
+            if canal["cursor"] >= len(cola):
+                canal["fin_cola_t"] = ahora   # empieza el tiempo de lectura
             return jsonify({"value": codigo})
-        calcular_estado_canal(canal)
     return jsonify({"value": "00000000"})
 
 
