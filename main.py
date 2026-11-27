@@ -13,6 +13,7 @@ app = Flask(__name__)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 MODELO_GROQ = os.environ.get("MODELO_GROQ", "").strip() or "llama-3.1-8b-instant"
 ACCESS_KEY = os.environ.get("ACCESS_KEY", "cambia-esta-clave-123").strip()
+UPDATING_ENV = os.environ.get("UPDATING", "").strip().lower() in ("1", "true", "yes", "on")
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 DEFAULT_PASSWORD = "1234"
@@ -21,6 +22,16 @@ DEBOUNCE_SEG = 1.2
 MAX_RESPUESTA_CHARS = int(os.environ.get("MAX_RESPUESTA_CHARS", "160"))
 SEND_PACKET = os.environ.get("SEND_PACKET", "10111111").strip()
 LOCK = threading.RLock()
+
+# Cada estado en un pin distinto (8 bits):
+# Pin 1 (idx 0): libre / datos
+# Pin 2 (idx 1): reset
+# Pin 3 (idx 2): online
+# Pin 4 (idx 3): actualizarse
+STATUS_OFFLINE = "00000000"
+STATUS_RESET = "01000000"
+STATUS_ONLINE = "00100000"
+STATUS_UPDATING = "00010000"
 
 _BASE = " abcdefghijklmnopqrstuvwxyz1234567890-=.,;/"
 _SHIFT = "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%?&*()_+"
@@ -74,14 +85,20 @@ def crear_canal() -> dict:
         "reset_deadline": 0.0,
         "ultimo_paquete": "",
         "ultimo_paquete_t": 0.0,
+        "enviando_ia": False,
+        "estado_actual": "updating" if UPDATING_ENV else "online",
     }
 
 
 canales: dict[str, dict] = {
     DEFAULT_PASSWORD: crear_canal(),
-    "1234": crear_canal(),
+    "5467": crear_canal(),
 }
-ui_state = {"active_password": "1234", "toast": ""}
+ui_state = {
+    "active_password": "5467",
+    "toast": "",
+    "repo_updating": UPDATING_ENV,
+}
 
 
 def get_canal(password: str, crear_si_no_existe: bool = True) -> dict | None:
@@ -92,6 +109,35 @@ def get_canal(password: str, crear_si_no_existe: bool = True) -> dict | None:
                 return None
             canales[pwd] = crear_canal()
         return canales[pwd]
+
+
+def calcular_estado_canal(canal: dict, consumir_reset: bool = False) -> tuple[str, str]:
+    """Devuelve (etiqueta_estado, codigo_8bits) bajo LOCK."""
+    if canal["reset_pendiente"] and time.time() > canal["reset_deadline"]:
+        canal["reset_pendiente"] = False
+        canal["reset_pulsos"] = 0
+
+    if canal["reset_pendiente"]:
+        if consumir_reset:
+            canal["reset_pulsos"] += 1
+            if canal["reset_pulsos"] >= 2:
+                canal["reset_pendiente"] = False
+                canal["reset_pulsos"] = 0
+        canal["estado_actual"] = "reset"
+        return "reset", STATUS_RESET
+
+    hay_cola_pendiente = canal["cursor"] < len(canal["cola"])
+    actualizandose = (
+        ui_state["repo_updating"]
+        or canal["enviando_ia"]
+        or hay_cola_pendiente
+    )
+    if actualizandose:
+        canal["estado_actual"] = "updating"
+        return "updating", STATUS_UPDATING
+
+    canal["estado_actual"] = "online"
+    return "online", STATUS_ONLINE
 
 
 def extraer_password_peticion() -> str:
@@ -172,13 +218,15 @@ def pedir_respuesta_ia(mensaje: str) -> str:
 def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
     with LOCK:
         canal["ultimo_enviado"] = mensaje
+        canal["enviando_ia"] = True
+        canal["estado_actual"] = "updating"
     print(f"[IA-SEND] pwd={pwd} mensaje={mensaje!r} client_ok={bool(client)} model={MODELO_GROQ}", flush=True)
-    if not client:
-        with LOCK:
-            canal["respuesta"] = "Missing GROQ_API_KEY"
-        print("[IA-ERROR] GROQ_API_KEY no configurada en el entorno", flush=True)
-        return "Error: Missing GROQ_API_KEY"
     try:
+        if not client:
+            with LOCK:
+                canal["respuesta"] = "Missing GROQ_API_KEY"
+            print("[IA-ERROR] GROQ_API_KEY no configurada en el entorno", flush=True)
+            return "Error: Missing GROQ_API_KEY"
         texto = pedir_respuesta_ia(mensaje)
         if texto:
             with LOCK:
@@ -205,6 +253,10 @@ def enviar_a_ia(canal: dict, pwd: str, mensaje: str) -> str:
             canal["respuesta"] = f"Error: {err_msg[:45]}"
         print(f"[IA-EXCEPTION] pwd={pwd} {err_msg}", flush=True)
         return f"Request failed: {err_msg[:60]}"
+    finally:
+        with LOCK:
+            canal["enviando_ia"] = False
+            calcular_estado_canal(canal)
 
 
 HTML_CHAT = """
@@ -236,7 +288,7 @@ HTML_CHAT = """
     <input type="password" id="access_key" name="access_key" placeholder="Enter your private access key" required>
 
     <label for="password">Screen Password (Header: Password: ...)</label>
-    <input type="text" id="password" name="password" value="{{ password }}" placeholder="e.g. 1234" required>
+    <input type="text" id="password" name="password" value="{{ password }}" placeholder="e.g. 5467" required>
     <div class="hint">Build Logic Header: Password: {{ password }}</div>
 
     <label for="mensaje">Send Message</label>
@@ -246,6 +298,7 @@ HTML_CHAT = """
   </form>
 
   <div class="box">
+    <strong>Server / Channel status:</strong><p>{{ estado_actual }} ({{ status_bits }})</p>
     <strong>Screen Password:</strong><p>{{ password }}</p>
     <strong>Last keypad packet / code:</strong><p>{{ ultimo_packet_teclado }}</p>
     <strong>Keypad draft:</strong><p>{{ borrador_teclado }}</p>
@@ -281,8 +334,11 @@ def render_page(password: str, toast_msg: str = ""):
     pwd = (password or "").strip() or ui_state["active_password"] or DEFAULT_PASSWORD
     canal = get_canal(pwd, crear_si_no_existe=True)
     with LOCK:
+        estado_etiqueta, estado_bits = calcular_estado_canal(canal)
         return render_template_string(
             HTML_CHAT,
+            estado_actual=estado_etiqueta,
+            status_bits=estado_bits,
             password=pwd,
             ultimo_packet_teclado=canal["ultimo_packet_teclado"] or "(none)",
             borrador_teclado=canal["borrador_teclado"] or "(empty)",
@@ -306,22 +362,59 @@ def web_chat():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "groq": bool(client), "model": MODELO_GROQ})
+    with LOCK:
+        st = "updating" if ui_state["repo_updating"] else "online"
+    return jsonify({"ok": True, "status": st, "groq": bool(client), "model": MODELO_GROQ})
+
+
+@app.route("/update-status", methods=["POST"])
+def update_status():
+    data = request.get_json(silent=True) or {}
+    form = request.form or {}
+    key_introducida = (
+        request.headers.get("X-Access-Key")
+        or data.get("access_key")
+        or form.get("access_key")
+        or request.args.get("access_key")
+        or ""
+    ).strip()
+    if ACCESS_KEY and not hmac.compare_digest(key_introducida, ACCESS_KEY):
+        return jsonify({"ok": False, "error": "invalid access_key"}), 403
+
+    raw_flag = data.get("updating")
+    if raw_flag is None:
+        raw_flag = form.get("updating", request.args.get("updating", "1"))
+
+    if isinstance(raw_flag, bool):
+        flag = raw_flag
+    else:
+        flag = str(raw_flag).strip().lower() in ("1", "true", "yes", "on", "updating")
+
+    with LOCK:
+        ui_state["repo_updating"] = flag
+        for c in canales.values():
+            calcular_estado_canal(c)
+
+    print(f"[GITHUB-DEPLOY] repo_updating={flag}", flush=True)
+    return jsonify({
+        "ok": True,
+        "updating": flag,
+        "status": "updating" if flag else "online",
+        "value": STATUS_UPDATING if flag else STATUS_ONLINE,
+    })
 
 
 @app.route("/status", methods=["GET"])
 def leer_status():
     pwd = extraer_password_peticion()
     canal = get_canal(pwd, crear_si_no_existe=False)
-    if canal:
-        with LOCK:
-            if canal["reset_pendiente"]:
-                canal["reset_pulsos"] += 1
-                if canal["reset_pulsos"] >= 2:
-                    canal["reset_pendiente"] = False
-                    canal["reset_pulsos"] = 0
-                return jsonify({"value": "10000000"})
-    return jsonify({"value": "00000000"})
+    if not canal:
+        return jsonify({"status": "offline", "value": STATUS_OFFLINE})
+
+    with LOCK:
+        estado_etiqueta, codigo_bits = calcular_estado_canal(canal, consumir_reset=True)
+
+    return jsonify({"status": estado_etiqueta, "value": codigo_bits})
 
 
 @app.route("/preguntar", methods=["POST"])
@@ -388,6 +481,8 @@ def recibir_teclado():
                     texto_envio = canal["borrador_teclado"].strip()
                     canal["borrador_teclado"] = ""
                     if texto_envio:
+                        canal["enviando_ia"] = True
+                        canal["estado_actual"] = "updating"
                         print(f"[TECLADO] enviando a IA desde teclado en pwd={pwd}: {texto_envio!r}", flush=True)
                     else:
                         print(f"[TECLADO] enviar pulsado pero borrador vacio en pwd={pwd}", flush=True)
@@ -404,6 +499,9 @@ def recibir_teclado():
         elif valor == "100":
             texto_envio = canal["borrador_teclado"].strip()
             canal["borrador_teclado"] = ""
+            if texto_envio:
+                canal["enviando_ia"] = True
+                canal["estado_actual"] = "updating"
         elif valor == "99":
             canal["borrador_teclado"] = canal["borrador_teclado"][:-1]
         elif valor in CODIGOS_SIMPLES:
@@ -412,6 +510,7 @@ def recibir_teclado():
             canal["borrador_teclado"] = (canal["borrador_teclado"] + valor)[:120]
 
         draft_actual = canal["borrador_teclado"]
+        calcular_estado_canal(canal)
 
     if texto_envio:
         enviar_a_ia(canal, pwd, texto_envio)
@@ -438,6 +537,7 @@ def leer_en_roblox():
             canal["reset_pulsos"] = 0
 
         if canal["reset_pendiente"]:
+            calcular_estado_canal(canal)
             return jsonify({"value": "00000000"})
 
         idx = canal["cursor"]
@@ -445,7 +545,9 @@ def leer_en_roblox():
         if idx < len(cola):
             codigo = normalizar_8bits(cola[idx])
             canal["cursor"] = idx + 1
+            calcular_estado_canal(canal)
             return jsonify({"value": codigo})
+        calcular_estado_canal(canal)
     return jsonify({"value": "00000000"})
 
 
